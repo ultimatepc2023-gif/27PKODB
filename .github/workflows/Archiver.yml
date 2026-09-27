@@ -1,0 +1,64 @@
+name: Archiver
+
+on:
+  workflow_dispatch:
+
+  repository_dispatch:
+    types: [Archiver]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  Archiver:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check Actions Run
+        env:
+          GH_TOKEN: ${{ secrets.OGT }}
+          REPO: ${{ secrets.REPO }}
+        run: |
+          set -e
+
+          echo "=========================================="
+          echo "Checking repository: $REPO"
+          echo "=========================================="
+
+          RUNNING=$(gh run list \
+            --repo "$REPO" \
+            --status in_progress \
+            --limit 100 \
+            --json databaseId \
+            --jq 'length')
+
+          QUEUED=$(gh run list \
+            --repo "$REPO" \
+            --status queued \
+            --limit 100 \
+            --json databaseId \
+            --jq 'length')
+
+          echo "Running Actions : $RUNNING"
+          echo "Queued Actions  : $QUEUED"
+
+          if [ "$RUNNING" -eq 0 ] && [ "$QUEUED" -eq 0 ]; then
+
+            echo "No Actions are running or queued."
+            echo "Triggering main.yml in THIS repository..."
+
+            GH_TOKEN="${{ secrets.GH_PAT }}" \
+            gh workflow run main.yml \
+              --repo "${{ github.repository }}" \
+              --ref main
+
+            echo "main.yml triggered successfully."
+
+          else
+
+            echo "An Action is running or queued."
+            echo "Not triggering main.yml."
+            echo "Archiver finished."
+
+          fi
