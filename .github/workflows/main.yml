@@ -229,7 +229,7 @@ jobs:
           winget install --id AutoHotkey.AutoHotkey  --exact --source winget --accept-source-agreements --accept-package-agreements
 
           python -m pip install --upgrade pip
-          pip install requests requests-toolbelt
+          pip install requests requests-toolbelt Pillow tqdm
 
       - name: Download & Configure OBS Scenes & Profiles
         shell: pwsh
@@ -452,12 +452,13 @@ jobs:
           LOGIN_URL:    ${{ secrets.LOGIN_URL }}
           LOGIN_TIME:   ${{ secrets.LOGIN_TIME }}
           OBS_URL:      ${{ secrets.OBS_URL }}
-          CORE_TIME:     ${{ secrets.CORE_TIME }}
+          CORE_TIME:    ${{ secrets.CORE_TIME }}
           AHK_URL:      ${{ secrets.AHK_URL }}
           AHK_TIME:     ${{ secrets.AHK_TIME }}
           UPLOAD_URL:   ${{ secrets.UPLOAD_URL }}
           UPLOAD_TIME:  ${{ secrets.UPLOAD_TIME }}
           OBS_REC_TIME: ${{ secrets.OBS_REC_TIME }}
+          REPORTER_URL: ${{ secrets.REPORTER_URL }}
         run: |
           New-Item -ItemType Directory -Path "C:\Cloud" -Force | Out-Null
           $rdpUser = "Cloud PC"
@@ -472,18 +473,18 @@ jobs:
           
           # --- 1. Login Task (daily only, no at-logon trigger) ---
           if (-not [string]::IsNullOrWhiteSpace($env:LOGIN_URL) -and -not [string]::IsNullOrWhiteSpace($env:LOGIN_TIME)) {
-              $loginFile = "login.ahk"
+              $loginFile = "login.ps1"
               $loginDest = "C:\Cloud\$loginFile"
               $loginName = "LoginTask"
           
               Write-Host "Downloading Login Script: $env:LOGIN_URL -> $loginDest"
               try {
                   Invoke-WebRequest -Uri $env:LOGIN_URL -OutFile $loginDest
-                  $action    = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c start `"`" `"$loginDest`"" -WorkingDirectory "C:\Cloud"
+                  $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$loginDest`"" -WorkingDirectory "C:\Cloud"
                   $trigger   = New-ScheduledTaskTrigger -Daily -At $env:LOGIN_TIME
                   $principal = New-ScheduledTaskPrincipal -UserId $rdpUser -LogonType Interactive -RunLevel Highest
                   Register-ScheduledTask -TaskName $loginName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
-                  Write-Host "Successfully registered Login Task '$loginName' ($loginDest) at $env:LOGIN_TIME"
+                  Write-Host "Successfully registered Login Task '$loginName' at $env:LOGIN_TIME"
               } catch {
                   Write-Warning "Failed setting up Login Task: $($_.Exception.Message)"
               }
@@ -550,6 +551,25 @@ jobs:
                   Write-Host "Successfully registered Upload Task '$uploadName' at $env:UPLOAD_TIME"
               } catch {
                   Write-Warning "Failed setting up Upload Task: $($_.Exception.Message)"
+              }
+          }
+
+          # --- 5. REPORTER Task (daily only, no at-logon trigger) ---
+          if (-not [string]::IsNullOrWhiteSpace($env:REPORTER_URL) -and -not [string]::IsNullOrWhiteSpace($env:CORE_TIME)) {
+              $reporterFile = "reporter.py"
+              $reporterDest = "C:\Cloud\$reporterFile"
+              $reporterName = "ReporterTask"
+          
+              Write-Host "Downloading Upload Script: $env:REPORTER_URL -> $reporterDest"
+              try {
+                  Invoke-WebRequest -Uri $env:REPORTER_URL -OutFile $reporterDest
+                  $action    = New-ScheduledTaskAction -Execute "python" -Argument "`"$reporterDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger   = New-ScheduledTaskTrigger -Daily -At $env:CORE_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId $rdpUser -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $reporterName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+                  Write-Host "Successfully registered Reporter Task '$reporterName' at $env:CORE_TIME"
+              } catch {
+                  Write-Warning "Failed setting up Reporter Task: $($_.Exception.Message)"
               }
           }
 
