@@ -15,83 +15,293 @@ on:
         description: 'Target Windows Password'
         required: false
 
+concurrency:
+  group: rdp-bridge-${{ github.event.client_payload.ip || inputs.ip || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   RDP:
     runs-on: ubuntu-latest
-    timeout-minutes: 250
+    timeout-minutes: 240
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      APT_UPDATE_TIMEOUT: 300
+      APT_INSTALL_TIMEOUT: 480
+      APT_MAX_ATTEMPTS: 5
+      RDP_CONNECT_TIMEOUT: 60
 
     steps:
-      - name: Add Tailscale Repository & Install Dependencies
+      - name: Preflight validation
+        env:
+          DISPATCH_IP: ${{ github.event.client_payload.ip }}
+          INPUT_IP: ${{ inputs.ip }}
         run: |
-          # 1. Add Tailscale GPG Key & Repo
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          set -euo pipefail
+          fail=0
 
-          # 2. Install Tailscale, Xvfb, FreeRDP, and PulseAudio dependencies
-          sudo apt-get update
-          sudo apt-get install -y tailscale xvfb freerdp2-x11 pulseaudio alsa-utils libasound2-plugins
-          
-      - name: Authenticate Tailscale
+          if [ -z "${TS_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTH_KEY is missing"; fail=1
+          fi
+
+          IP="${DISPATCH_IP:-${INPUT_IP:-}}"
+          if [ -z "$IP" ]; then
+            echo "::error::No target IP supplied"; fail=1
+          fi
+
+          echo "Runner: $(lsb_release -ds 2>/dev/null || head -1 /etc/os-release)"
+          [ "$fail" -eq 1 ] && exit 1
+          echo "Preflight OK -> $IP"
+
+      - name: Install dependencies
+        timeout-minutes: 60
         run: |
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-                            --hostname=rdp-bridge-${{ github.run_id }} \
-                            --accept-routes
-          sleep 3
-          tailscale status || true
+          set -uo pipefail
 
-      - name: Resolve IP & Credentials
-        run: |
-          TARGET_IP="${{ github.event.client_payload.ip || inputs.ip }}"
-          TARGET_USER="${{ github.event.client_payload.username || inputs.username || secrets.RDP_USER || 'Cloud PC' }}"
-          TARGET_PASS="${{ github.event.client_payload.password || inputs.password || secrets.RDP_PASSWORD || '123456' }}"
+          apt_get() {
+            local cap="$1"; shift
+            sudo timeout --kill-after=20s "${cap}s" apt-get "$@" \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 \
+              -o Acquire::ForceIPv4=true \
+              -o Dpkg::Options::=--force-confdef \
+              -o Dpkg::Options::=--force-confold
+          }
 
-          if [ -z "$TARGET_IP" ]; then
-            echo "::error::TARGET_IP is empty"
+          recover_apt() {
+            echo "::warning::apt/dpkg stuck - killing and cleaning up"
+            sudo pkill -9 -f 'apt-get|dpkg|unattended-upgr' 2>/dev/null || true
+            sleep 2
+            sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+                       /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
+            sudo dpkg --configure -a >/dev/null 2>&1 || true
+            sudo timeout 120s apt-get -f install -y --no-install-recommends >/dev/null 2>&1 || true
+            sleep 5
+          }
+
+          for i in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 --max-time 60 \
+                 https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
+                 | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null \
+               && curl -fsSL --retry 3 --retry-delay 2 --max-time 60 \
+                 https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
+                 | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null ; then
+              break
+            fi
+            echo "::warning::Repo setup attempt $i failed"
+            sleep 5
+          done
+
+          ok=0
+          for i in $(seq 1 "$APT_MAX_ATTEMPTS"); do
+            if apt_get "$APT_UPDATE_TIMEOUT" update; then ok=1; break; fi
+            recover_apt
+          done
+          [ "$ok" -eq 1 ] || { echo "::error::apt-get update failed"; exit 1; }
+
+          RDP_PKG=""
+          for pkg in freerdp3-x11 freerdp2-x11 freerdp-x11; do
+            if apt-cache pkgnames "$pkg" 2>/dev/null | grep -qx "$pkg"; then
+              RDP_PKG="$pkg"; break
+            fi
+          done
+          if [ -z "$RDP_PKG" ]; then
+            echo "::error::No FreeRDP X11 package available"
+            apt-cache search freerdp || true
+            exit 1
+          fi
+          echo "Using package: $RDP_PKG"
+          echo "RDP_PKG=$RDP_PKG" >> "$GITHUB_ENV"
+
+          ok=0
+          for i in $(seq 1 "$APT_MAX_ATTEMPTS"); do
+            if apt_get "$APT_INSTALL_TIMEOUT" install -y --no-install-recommends \
+                 "$RDP_PKG" tailscale xvfb ; then
+              ok=1; break
+            fi
+            recover_apt
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Core package install failed"
             exit 1
           fi
 
-          echo "TARGET_IP=$TARGET_IP"     >> $GITHUB_ENV
-          echo "TARGET_USER=$TARGET_USER" >> $GITHUB_ENV
-          echo "TARGET_PASS=$TARGET_PASS" >> $GITHUB_ENV
+          AUDIO_OK=0
+          for i in 1 2 3; do
+            if apt_get "$APT_INSTALL_TIMEOUT" install -y --no-install-recommends \
+                 pulseaudio alsa-utils libasound2-plugins ; then
+              AUDIO_OK=1; break
+            fi
+            recover_apt
+          done
+          echo "AUDIO_OK=$AUDIO_OK" >> "$GITHUB_ENV"
+          [ "$AUDIO_OK" -eq 1 ] || echo "::warning::Audio unavailable"
+
+          BIN=""
+          for b in xfreerdp3 xfreerdp; do
+            command -v "$b" >/dev/null 2>&1 && { BIN="$b"; break; }
+          done
+          if [ -z "$BIN" ]; then
+            echo "::error::xfreerdp binary missing"
+            dpkg -L "$RDP_PKG" || true
+            exit 1
+          fi
+          echo "XFREERDP_BIN=$BIN" >> "$GITHUB_ENV"
+          "$BIN" /version || true
+
+      - name: Authenticate Tailscale
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+          HOST="rdp-bridge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
+          ok=0
+          for i in 1 2 3 4; do
+            if sudo tailscale up --authkey="$TS_AUTHKEY" \
+                                 --hostname="$HOST" \
+                                 --accept-routes --timeout=60s ; then
+              ok=1; break
+            fi
+            echo "::warning::tailscale up attempt $i failed"
+            sudo tailscale down >/dev/null 2>&1 || true
+            sleep $((i * 5))
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Tailscale auth failed"
+            sudo tailscale status || true
+            exit 1
+          fi
+          sudo tailscale status || true
+
+      - name: Resolve IP and credentials
+        env:
+          DISPATCH_IP:   ${{ github.event.client_payload.ip }}
+          DISPATCH_USER: ${{ github.event.client_payload.username }}
+          DISPATCH_PASS: ${{ github.event.client_payload.password }}
+          INPUT_IP:      ${{ inputs.ip }}
+          INPUT_USER:    ${{ inputs.username }}
+          INPUT_PASS:    ${{ inputs.password }}
+          SECRET_USER:   ${{ secrets.RDP_USER }}
+          SECRET_PASS:   ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          TARGET_IP="${DISPATCH_IP:-${INPUT_IP:-}}"
+          TARGET_USER="${DISPATCH_USER:-${INPUT_USER:-${SECRET_USER:-Cloud PC}}}"
+          TARGET_PASS="${DISPATCH_PASS:-${INPUT_PASS:-${SECRET_PASS:-123456}}}"
+          [ -n "$TARGET_IP" ] || { echo "::error::TARGET_IP is empty"; exit 1; }
+
+          { echo "TARGET_IP=$TARGET_IP"
+            echo "TARGET_USER=$TARGET_USER"
+            echo "TARGET_PASS=$TARGET_PASS"
+          } >> "$GITHUB_ENV"
 
           echo "::add-mask::$TARGET_PASS"
           echo "::add-mask::$TARGET_USER"
           echo "Resolved target: $TARGET_IP"
 
-      - name: Run Persistent RDP Session inside XVFB
+      - name: Check target reachability
         run: |
-          echo "Connecting headless RDP session to $TARGET_IP..."
+          set -uo pipefail
+          for i in 1 2 3; do
+            sudo tailscale ping -c 2 --timeout=5s "$TARGET_IP" && break
+            sleep 3
+          done || echo "::warning::tailscale ping failed"
 
-          # 1. Start Virtual X Server
-          Xvfb :99 -screen 0 1920x1080x24 &
+          tcp_ok=0
+          for i in 1 2 3; do
+            if timeout 10 bash -c "</dev/tcp/${TARGET_IP}/3389" 2>/dev/null; then tcp_ok=1; break; fi
+            sleep 5
+          done
+          if [ "$tcp_ok" -eq 0 ]; then
+            echo "::warning::TCP 3389 not reachable yet"
+          fi
+
+      - name: Run persistent RDP session
+        timeout-minutes: 225
+        run: |
+          set -uo pipefail
+
+          XVFB_PID=""; RDP_PID=""
+
+          cleanup() {
+            [ -n "$RDP_PID" ] && kill -9 "$RDP_PID" 2>/dev/null || true
+            [ -n "$XVFB_PID" ] && kill -9 "$XVFB_PID" 2>/dev/null || true
+            command -v pulseaudio >/dev/null 2>&1 && pulseaudio -k 2>/dev/null || true
+            sudo tailscale down 2>/dev/null || true
+          }
+          trap cleanup EXIT INT TERM
+
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+          XVFB_PID=$!
           export DISPLAY=:99
           sleep 2
+          kill -0 "$XVFB_PID" 2>/dev/null || { echo "::error::Xvfb failed to start"; exit 1; }
 
-          # 2. Start Virtual PulseAudio Daemon for Sound Handling
-          pulseaudio --start --exit-idle-time=-1
-          sleep 1
+          SOUND_ARGS=()
+          if [ "${AUDIO_OK:-0}" = "1" ] && pulseaudio --start --exit-idle-time=-1 2>/dev/null; then
+            SOUND_ARGS=(/sound:sys:pulse)
+          fi
 
-          # 3. Launch FreeRDP session with sound redirection
-          xfreerdp /v:"$TARGET_IP" \
-                   /u:"$TARGET_USER" \
-                   /p:"$TARGET_PASS" \
-                   /size:1920x1080 \
-                   /cert-ignore \
-                   /cert:ignore \
-                   /gfx \
-                   /network:auto \
-                   /sound:sys:pulse &
-
+          "$XFREERDP_BIN" /v:"$TARGET_IP" \
+                         /u:"$TARGET_USER" \
+                         /p:"$TARGET_PASS" \
+                         /size:1920x1080 \
+                         /cert:ignore \
+                         /gfx \
+                         /network:auto \
+                         /log-level:WARN \
+                         "${SOUND_ARGS[@]}" &
           RDP_PID=$!
-          echo "RDP Client running under PID: $RDP_PID"
+          echo "xfreerdp PID: $RDP_PID"
 
-          # Give process a moment to establish connection
-          sleep 5
+          connected=0
+          elapsed=0
+          while [ "$elapsed" -lt "$RDP_CONNECT_TIMEOUT" ]; do
+            if ! kill -0 "$RDP_PID" 2>/dev/null; then break; fi
+            if ss -tnp 2>/dev/null | grep -Eq "ESTAB.*:3389"; then
+              connected=1; break
+            fi
+            sleep 3
+            elapsed=$((elapsed + 3))
+          done
 
-          # 4. Monitor loop: Keep active as long as RDP session remains alive
-          while kill -0 $RDP_PID 2>/dev/null; do
-            echo "[$(date)] Linux Bridge actively maintaining GUI & Audio session on $TARGET_IP..."
+          if [ "$connected" -eq 0 ]; then
+            echo "::warning::No RDP session within ${RDP_CONNECT_TIMEOUT}s - ending job"
+            kill -9 "$RDP_PID" 2>/dev/null || true
+            wait "$RDP_PID" 2>/dev/null || true
+            exit 0
+          fi
+
+          echo "RDP session established to $TARGET_IP"
+
+          while kill -0 "$RDP_PID" 2>/dev/null; do
+            if ! sudo tailscale status >/dev/null 2>&1; then
+              sudo tailscale up --authkey="$TS_AUTHKEY" \
+                                --hostname="rdp-bridge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}" \
+                                --accept-routes --timeout=60s || true
+            fi
+            if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+              Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+              XVFB_PID=$!
+            fi
+            echo "[$(date -u +%H:%M:%S)] Bridge alive on $TARGET_IP (pid $RDP_PID)"
             sleep 15
           done
 
-          echo "RDP connection closed or overridden. Terminating action cleanly."
+          wait "$RDP_PID" 2>/dev/null || true
+          echo "RDP session ended - target disconnected or closed. Finishing job cleanly."
+          exit 0
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "::group::Tailscale status";  sudo tailscale status || true;        echo "::endgroup::"
+          echo "::group::Processes"
+          ps -eo pid,etime,cmd | grep -Ei 'xfreerdp|Xvfb|pulseaudio|tailscale' | grep -v grep || true
+          echo "::endgroup::"
+          echo "::group::FreeRDP packages";  dpkg -l | grep -i freerdp || true;     echo "::endgroup::"
+          echo "::group::apt history";       tail -n 40 /var/log/apt/history.log 2>/dev/null || true; echo "::endgroup::"
+          echo "::group::Disk";              df -h;                                echo "::endgroup::"
