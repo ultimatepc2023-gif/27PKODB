@@ -153,40 +153,65 @@ jobs:
           echo "::add-mask::$TARGET_USER"
           echo "Resolved target: $TARGET_IP"
 
-      - name: Run Persistent RDP Session inside XVFB
+      - name: Run Persistent RDP Session inside XVFB (with retry + keep-alive)
         run: |
+          set +e   # <-- IMPORTANT: don't abort the job on transient failures
+
           echo "Connecting headless RDP session to $TARGET_IP..."
 
-          # 1. Start Virtual X Server
+          # 1. Virtual X Server
           Xvfb :99 -screen 0 1920x1080x24 &
+          XVFB_PID=$!
           export DISPLAY=:99
           sleep 2
 
-          # 2. Start Virtual PulseAudio Daemon for Sound Handling
-          pulseaudio --start --exit-idle-time=-1
+          # 2. PulseAudio
+          pulseaudio --start --exit-idle-time=-1 || true
           sleep 1
 
-          # 3. Launch FreeRDP session with sound redirection
-          xfreerdp /v:"$TARGET_IP" \
-                   /u:"$TARGET_USER" \
-                   /p:"$TARGET_PASS" \
-                   /size:1920x1080 \
-                   /cert-ignore \
-                   /cert:ignore \
-                   /gfx \
-                   /network:auto \
-                   /sound:sys:pulse &
+          MAX_ATTEMPTS=50          # ~50 * (10s run + 15s backoff) ≈ 20 min of retries
+          ATTEMPT=0
 
-          RDP_PID=$!
-          echo "RDP Client running under PID: $RDP_PID"
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT+1))
+            echo "=== RDP attempt $ATTEMPT/$MAX_ATTEMPTS -> $TARGET_IP ==="
 
-          # Give process a moment to establish connection
-          sleep 5
+            # NOTE: only /cert:ignore (works on FreeRDP 2.x and 3.x)
+            #       /cert-ignore was removed in FreeRDP 3.x -> parse error
+            xfreerdp /v:"$TARGET_IP" \
+                     /u:"$TARGET_USER" \
+                     /p:"$TARGET_PASS" \
+                     /size:1920x1080 \
+                     /cert:ignore \
+                     /gfx \
+                     /network:auto \
+                     /sound:sys:pulse &
+            RDP_PID=$!
+            echo "xfreerdp launched, PID=$RDP_PID"
 
-          # 4. Monitor loop: Keep active as long as RDP session remains alive
-          while kill -0 $RDP_PID 2>/dev/null; do
-            echo "[$(date)] Linux Bridge actively maintaining GUI & Audio session on $TARGET_IP..."
-            sleep 15
+            # Give it time to either die on parse error or actually connect
+            sleep 10
+
+            if kill -0 $RDP_PID 2>/dev/null; then
+              echo "RDP client survived startup, monitoring session..."
+              # Keep alive as long as it's running
+              while kill -0 $RDP_PID 2>/dev/null; do
+                echo "[$(date)] Bridge maintaining GUI+Audio session on $TARGET_IP..."
+                sleep 15
+              done
+              echo "RDP session ended."
+            else
+              echo "RDP client exited during startup (attempt $ATTEMPT)."
+              # Try to show any leftover diagnostic output
+              wait $RDP_PID
+              RC=$?
+              echo "xfreerdp exit code was: $RC"
+            fi
+
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "Retrying in 15s..."
+              sleep 15
+            fi
           done
 
-          echo "RDP connection closed or overridden. Terminating action cleanly."
+          echo "::warning::All $MAX_ATTEMPTS RDP attempts exhausted — job finishing."
